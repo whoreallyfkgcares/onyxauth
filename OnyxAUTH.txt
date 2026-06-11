@@ -1,0 +1,78 @@
+OnyxAUTH — Agent Reference
+==========================
+
+## What this is
+Centralized auth service for the Onyx platform. Deployed at auth.onyxpowered.com.
+All Onyx apps live on subdomains of onyxpowered.com, sharing a single session cookie.
+Built on Next.js 16 + Better Auth 1.6 + Postgres + shadcn/ui (Vercel dark theme).
+
+## Stack
+- Framework: Next.js 16 (breaking changes — middleware is proxy.ts with named export `proxy`, cookies()/headers() must be awaited)
+- Auth: Better Auth 1.6 (plugins: onyx keypair, nextCookies)
+- DB: Postgres via pg Pool
+- UI: shadcn/ui v4 (radix/lyra preset — all rounded-none manually patched to rounded-md/xl)
+- Styling: Vercel dark — pure black bg, Geist Sans, white primary, white focus rings
+- App name: configured via NEXT_PUBLIC_APP_NAME env var, defaults to "Zero" (src/lib/config.ts)
+
+## Auth methods
+1. Email + password (Better Auth built-in)
+2. Google OAuth (optional, enabled if GOOGLE_CLIENT_ID/SECRET set)
+3. GitHub OAuth (optional, enabled if GITHUB_CLIENT_ID/SECRET set)
+4. Onyx Pass — Ed25519 keypair stored in localStorage (onyx.identity.v1)
+   - Challenge/verify flow: POST /api/auth/onyx/challenge → POST /api/auth/onyx/verify
+   - Link Pass to existing account: POST /api/auth/onyx/link (requires session cookie)
+   - Client lib: src/lib/onyx/identity.ts (getOrCreateOnyxIdentity, signOnyxChallenge)
+   - Server plugin: src/lib/onyx/plugin.ts
+   - Client plugin: src/lib/onyx/client.ts
+
+## Cross-subdomain session
+Session cookie is set with domain=COOKIE_DOMAIN (e.g. .onyxpowered.com).
+All *.onyxpowered.com apps share the cookie automatically — no token handoff needed.
+Calling apps validate sessions server-side via Better Auth's auth.api.getSession().
+
+## Routing a user to auth from a calling app
+Link to:
+  https://auth.onyxpowered.com/login?redirectTo=https://zero.onyxpowered.com/dashboard
+  https://auth.onyxpowered.com/signup?redirectTo=https://zero.onyxpowered.com/dashboard
+
+After auth, user is redirected to redirectTo. Only *.onyxpowered.com destinations are
+accepted (validated in src/lib/redirect.ts) — anything else falls back to /account.
+The redirectTo param is preserved across login↔signup navigation and through Pass flow.
+
+## Key env vars (production)
+  DATABASE_URL                  Postgres connection string
+  BETTER_AUTH_SECRET            Random secret for signing tokens
+  BETTER_AUTH_URL               https://auth.onyxpowered.com
+  COOKIE_DOMAIN                 .onyxpowered.com
+  BETTER_AUTH_TRUSTED_ORIGINS   Comma-separated app origins, e.g.:
+                                  https://zero.onyxpowered.com,https://opal.onyxpowered.com
+  NEXT_PUBLIC_APP_NAME          Platform name shown in UI (default: "Zero")
+  GOOGLE_CLIENT_ID/SECRET       Optional — enables Google sign-in
+  GITHUB_CLIENT_ID/SECRET       Optional — enables GitHub sign-in
+
+## Key source files
+  src/lib/auth.ts               Better Auth server config
+  src/lib/auth-client.ts        Better Auth client config
+  src/lib/onyx/plugin.ts        Onyx keypair server plugin (challenge, verify, link endpoints)
+  src/lib/onyx/client.ts        Onyx keypair client plugin
+  src/lib/onyx/identity.ts      Client-side keypair generation/signing (localStorage)
+  src/lib/redirect.ts           redirectTo validation (*.onyxpowered.com only)
+  src/lib/config.ts             APP_NAME config
+  src/proxy.ts                  Route protection + redirectTo passthrough (Next.js 16 middleware)
+  src/app/api/auth/[...all]/route.ts  Better Auth handler
+  src/components/auth/          All auth UI components
+  src/components/onyx-logo.tsx  OnyxWhite.png logo component
+
+## Post-signup Pass flow
+After email signup, user is shown SavePassPrompt (src/components/auth/save-pass-prompt.tsx).
+"Save Pass" generates a keypair via getOrCreateOnyxIdentity(), then calls /onyx/link to bind
+it to the new account. "Skip" redirects directly to redirectTo (or /account).
+
+## Cross-device Pass (TODO — Option A, implement when email server is available)
+Private key is currently localStorage-only (single browser).
+Plan: encrypt private key client-side with PBKDF2-derived key from user password,
+store ciphertext server-side. On new device: email auth → fetch blob → decrypt → import.
+
+## Pending (needs email server)
+- Forgot password / reset flow
+- Email verification
