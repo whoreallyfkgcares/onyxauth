@@ -6,9 +6,8 @@ export const onyxClient = () => {
     id: "onyx",
     $InferServerPlugin: {} as ReturnType<typeof onyx>,
     pathMethods: {
-      "/onyx/challenge": "POST",
-      "/onyx/verify": "POST",
-      "/onyx/link": "POST",
+      "/onyx/create-pass": "POST",
+      "/onyx/auth": "POST",
     },
   } satisfies BetterAuthClientPlugin;
 };

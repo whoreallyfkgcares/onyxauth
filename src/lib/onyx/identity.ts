@@ -1,57 +1,23 @@
 "use client";
 
-import { getPublicKeyAsync, signAsync, utils } from "@noble/ed25519";
+// The Onyx Pass device token is the only credential stored in the browser.
+// The actual Ed25519 keypair lives server-side, encrypted with PASS_ENCRYPTION_KEY.
+// This token rotates on every successful auth — stealing it grants at most one use.
 
-/**
- * Client-side Onyx identity. In production this key lives in the Onyx
- * platform's keychain; for this app a keypair is generated on first use
- * and persisted in localStorage.
- */
+const STORAGE_KEY = "onyx.pass.v2";
 
-const STORAGE_KEY = "onyx.identity.v1";
-
-function toBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+export function getDeviceToken(): string | null {
+  return localStorage.getItem(STORAGE_KEY);
 }
 
-function fromBase64Url(value: string): Uint8Array {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+export function saveDeviceToken(token: string): void {
+  localStorage.setItem(STORAGE_KEY, token);
 }
 
-export interface OnyxIdentity {
-  publicKey: string; // base64url raw 32-byte Ed25519 key
-}
-
-export async function getOrCreateOnyxIdentity(): Promise<OnyxIdentity> {
-  const stored = localStorage.getItem(STORAGE_KEY);
-  let secretKey: Uint8Array;
-  if (stored) {
-    secretKey = fromBase64Url(stored);
-  } else {
-    secretKey = utils.randomSecretKey();
-    localStorage.setItem(STORAGE_KEY, toBase64Url(secretKey));
-  }
-  const publicKey = await getPublicKeyAsync(secretKey);
-  return { publicKey: toBase64Url(publicKey) };
-}
-
-export async function signOnyxChallenge(challenge: string): Promise<string> {
-  const stored = localStorage.getItem(STORAGE_KEY);
-  if (!stored) throw new Error("No Onyx identity found");
-  const secretKey = fromBase64Url(stored);
-  const signature = await signAsync(
-    new TextEncoder().encode(challenge),
-    secretKey,
-  );
-  return toBase64Url(signature);
-}
-
-export function resetOnyxIdentity(): void {
+export function clearDeviceToken(): void {
   localStorage.removeItem(STORAGE_KEY);
+}
+
+export function hasPass(): boolean {
+  return !!localStorage.getItem(STORAGE_KEY);
 }

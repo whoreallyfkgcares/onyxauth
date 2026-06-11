@@ -1,53 +1,95 @@
-import { createPublicKey, randomBytes, verify as edVerify } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createPublicKey,
+  generateKeyPairSync,
+  randomBytes,
+} from "node:crypto";
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthEndpoint } from "better-auth/api";
 import { getSessionCookie, setSessionCookie } from "better-auth/cookies";
 import * as z from "zod";
 
 /**
- * "Login with Onyx" — keypair-based authentication.
+ * Onyx Pass — server-managed keypair authentication.
  *
- * Flow (all verification server-side):
- *   1. POST /onyx/challenge { publicKey }            → { challenge }
- *   2. Client signs the challenge with its Ed25519 private key.
- *   3. POST /onyx/verify { publicKey, signature }    → session cookie + token
+ * The Ed25519 private key never leaves the server. It is encrypted with
+ * AES-256-GCM using PASS_ENCRYPTION_KEY and stored in the onyxKey table.
+ * The client stores only a rotating device token (32 random bytes, base64url).
  *
- * Public keys are raw 32-byte Ed25519 keys, base64url-encoded.
- * Signatures are 64-byte Ed25519 signatures, base64url-encoded.
- * Challenges are single-use and expire after 5 minutes.
+ * Flows:
+ *   POST /onyx/create-pass  (requires session)
+ *     → generates Ed25519 keypair, encrypts privKey, stores record
+ *     → returns { deviceToken, publicKey }
+ *
+ *   POST /onyx/auth { deviceToken }
+ *     → looks up record, decrypts privKey in memory, creates session
+ *     → rotates deviceToken, returns { deviceToken }
  */
 
-const CHALLENGE_TTL_MS = 5 * 60 * 1000;
-// DER prefix that wraps a raw 32-byte Ed25519 key into SPKI format
-const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+// ── Encryption ────────────────────────────────────────────────────────────────
 
-const publicKeySchema = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{43}$/, "publicKey must be a base64url raw Ed25519 key");
-
-function decodeBase64Url(value: string): Buffer {
-  return Buffer.from(value, "base64url");
+function getEncryptionKey(): Buffer {
+  const raw = process.env.PASS_ENCRYPTION_KEY;
+  if (!raw) throw new Error("PASS_ENCRYPTION_KEY is not set");
+  const key = Buffer.from(raw, "base64");
+  if (key.length !== 32) throw new Error("PASS_ENCRYPTION_KEY must be 32 bytes (base64-encoded)");
+  return key;
 }
 
-function verifyOnyxSignature(
-  publicKey: string,
-  challenge: string,
-  signature: string,
-): boolean {
-  const rawKey = decodeBase64Url(publicKey);
-  const rawSig = decodeBase64Url(signature);
-  if (rawKey.length !== 32 || rawSig.length !== 64) return false;
-  try {
-    const keyObject = createPublicKey({
-      key: Buffer.concat([ED25519_SPKI_PREFIX, rawKey]),
-      format: "der",
-      type: "spki",
-    });
-    return edVerify(null, Buffer.from(challenge, "utf8"), keyObject, rawSig);
-  } catch {
-    return false;
-  }
+// Packed format: 12-byte IV | 16-byte GCM tag | ciphertext — all base64url
+function encryptPrivKey(rawPrivKey: Buffer): string {
+  const key = getEncryptionKey();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(rawPrivKey), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]).toString("base64url");
 }
+
+function decryptPrivKey(stored: string): Buffer {
+  const key = getEncryptionKey();
+  const data = Buffer.from(stored, "base64url");
+  const iv = data.subarray(0, 12);
+  const tag = data.subarray(12, 28);
+  const ciphertext = data.subarray(28);
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+// ── Key generation ────────────────────────────────────────────────────────────
+
+// Ed25519 PKCS8 DER header is 16 bytes; raw private key follows (32 bytes).
+// Ed25519 SPKI DER header is 12 bytes; raw public key follows (32 bytes).
+function generateEd25519Keypair(): { rawPrivKey: Buffer; rawPubKey: Buffer } {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const privDer = privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
+  const pubDer = publicKey.export({ format: "der", type: "spki" }) as Buffer;
+  return {
+    rawPrivKey: Buffer.from(privDer.subarray(16, 48)),
+    rawPubKey: Buffer.from(pubDer.subarray(12, 44)),
+  };
+}
+
+function newDeviceToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+// ── Session helper ─────────────────────────────────────────────────────────────
+
+async function getSessionUserId(ctx: any): Promise<string | null> {
+  const token = getSessionCookie(ctx.request as Request);
+  if (!token) return null;
+  const row = (await ctx.context.adapter.findOne({
+    model: "session",
+    where: [{ field: "token", operator: "eq", value: token }],
+  })) as { userId: string; expiresAt: Date } | null;
+  if (!row || new Date() > new Date(row.expiresAt)) return null;
+  return row.userId;
+}
+
+// ── Plugin ────────────────────────────────────────────────────────────────────
 
 export const onyx = () => {
   return {
@@ -62,172 +104,116 @@ export const onyx = () => {
             index: true,
           },
           publicKey: { type: "string", required: true, unique: true },
+          encryptedPrivKey: { type: "string", required: true },
+          deviceToken: { type: "string", required: true, unique: true },
           createdAt: { type: "date", required: true },
+          updatedAt: { type: "date", required: true },
         },
       },
     },
     endpoints: {
-      onyxChallenge: createAuthEndpoint(
-        "/onyx/challenge",
-        {
-          method: "POST",
-          body: z.object({ publicKey: publicKeySchema }),
-        },
+      // Creates a new Pass for the currently authenticated user.
+      onyxCreatePass: createAuthEndpoint(
+        "/onyx/create-pass",
+        { method: "POST", requireRequest: true },
         async (ctx) => {
-          const { publicKey } = ctx.body;
-          const challenge = randomBytes(32).toString("base64url");
-          await ctx.context.internalAdapter.createVerificationValue({
-            identifier: `onyx:${publicKey}`,
-            value: challenge,
-            expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
-          });
-          return ctx.json({ challenge });
-        },
-      ),
-      onyxVerify: createAuthEndpoint(
-        "/onyx/verify",
-        {
-          method: "POST",
-          body: z.object({
-            publicKey: publicKeySchema,
-            signature: z.string().min(1),
-            name: z.string().max(120).optional(),
-          }),
-          requireRequest: true,
-        },
-        async (ctx) => {
-          const { publicKey, signature, name } = ctx.body;
+          const userId = await getSessionUserId(ctx);
+          if (!userId) throw new APIError("UNAUTHORIZED", { message: "Not authenticated" });
 
-          const verification =
-            await ctx.context.internalAdapter.findVerificationValue(
-              `onyx:${publicKey}`,
-            );
-          if (!verification || new Date() > verification.expiresAt) {
-            throw new APIError("UNAUTHORIZED", {
-              message: "Invalid or expired challenge",
-            });
-          }
-          // single-use: burn the challenge before verifying
-          await ctx.context.internalAdapter.deleteVerificationByIdentifier(
-            `onyx:${publicKey}`,
-          );
-
-          if (!verifyOnyxSignature(publicKey, verification.value, signature)) {
-            throw new APIError("UNAUTHORIZED", {
-              message: "Invalid Onyx signature",
-            });
-          }
-
-          const existingKey = await ctx.context.adapter.findOne<{
-            id: string;
-            userId: string;
-            publicKey: string;
-          }>({
+          // One Pass per user — remove existing if present
+          const existing = await ctx.context.adapter.findOne<{ id: string }>({
             model: "onyxKey",
-            where: [{ field: "publicKey", operator: "eq", value: publicKey }],
+            where: [{ field: "userId", operator: "eq", value: userId }],
           });
-
-          let user = existingKey
-            ? await ctx.context.adapter.findOne<{
-                id: string;
-                email: string;
-                name: string;
-                emailVerified: boolean;
-                createdAt: Date;
-                updatedAt: Date;
-              }>({
-                model: "user",
-                where: [{ field: "id", operator: "eq", value: existingKey.userId }],
-              })
-            : null;
-
-          if (!user) {
-            const fingerprint = publicKey.slice(0, 12).toLowerCase();
-            user = await ctx.context.internalAdapter.createUser({
-              name: name ?? `onyx:${fingerprint}`,
-              email: `${fingerprint}@keys.onyx`,
-              emailVerified: false,
-            });
-            await ctx.context.adapter.create({
+          if (existing) {
+            await ctx.context.adapter.delete({
               model: "onyxKey",
-              data: {
-                userId: user.id,
-                publicKey,
-                createdAt: new Date(),
-              },
+              where: [{ field: "userId", operator: "eq", value: userId }],
             });
-            await ctx.context.internalAdapter.createAccount({
-              userId: user.id,
-              providerId: "onyx",
-              accountId: publicKey,
-              createdAt: new Date(),
-              updatedAt: new Date(),
+            // Remove linked account record too
+            await ctx.context.adapter.delete({
+              model: "account",
+              where: [
+                { field: "userId", operator: "eq", value: userId },
+                { field: "providerId", operator: "eq", value: "onyx" },
+              ],
             });
           }
 
-          const session = await ctx.context.internalAdapter.createSession(
-            user.id,
-          );
-          if (!session) {
-            throw new APIError("INTERNAL_SERVER_ERROR", {
-              message: "Failed to create session",
-            });
-          }
-          await setSessionCookie(ctx, { session, user });
-
-          return ctx.json({
-            token: session.token,
-            user: { id: user.id, name: user.name, email: user.email },
-          });
-        },
-      ),
-      onyxLink: createAuthEndpoint(
-        "/onyx/link",
-        {
-          method: "POST",
-          body: z.object({ publicKey: publicKeySchema }),
-          requireRequest: true,
-        },
-        async (ctx) => {
-          const { publicKey } = ctx.body;
-
-          const sessionToken = getSessionCookie(ctx.request as Request);
-          if (!sessionToken) {
-            throw new APIError("UNAUTHORIZED", { message: "Not authenticated" });
-          }
-
-          const sessionRow = await ctx.context.adapter.findOne<{
-            id: string;
-            userId: string;
-            expiresAt: Date;
-          }>({
-            model: "session",
-            where: [{ field: "token", operator: "eq", value: sessionToken }],
-          });
-
-          if (!sessionRow || new Date() > new Date(sessionRow.expiresAt)) {
-            throw new APIError("UNAUTHORIZED", { message: "Session expired" });
-          }
-
-          const existing = await ctx.context.adapter.findOne({
-            model: "onyxKey",
-            where: [{ field: "publicKey", operator: "eq", value: publicKey }],
-          });
-          if (existing) return ctx.json({ success: true });
+          const { rawPrivKey, rawPubKey } = generateEd25519Keypair();
+          const publicKey = rawPubKey.toString("base64url");
+          const encryptedPrivKey = encryptPrivKey(rawPrivKey);
+          const deviceToken = newDeviceToken();
+          const now = new Date();
 
           await ctx.context.adapter.create({
             model: "onyxKey",
-            data: { userId: sessionRow.userId, publicKey, createdAt: new Date() },
+            data: { userId, publicKey, encryptedPrivKey, deviceToken, createdAt: now, updatedAt: now },
           });
           await ctx.context.internalAdapter.createAccount({
-            userId: sessionRow.userId,
+            userId,
             providerId: "onyx",
             accountId: publicKey,
-            createdAt: new Date(),
-            updatedAt: new Date(),
+            createdAt: now,
+            updatedAt: now,
           });
 
-          return ctx.json({ success: true });
+          return ctx.json({ deviceToken, publicKey });
+        },
+      ),
+
+      // Authenticates with a device token, rotates it, and creates a session.
+      onyxAuth: createAuthEndpoint(
+        "/onyx/auth",
+        {
+          method: "POST",
+          body: z.object({ deviceToken: z.string().min(1) }),
+          requireRequest: true,
+        },
+        async (ctx) => {
+          const { deviceToken } = ctx.body;
+
+          const record = await ctx.context.adapter.findOne<{
+            id: string;
+            userId: string;
+            publicKey: string;
+            encryptedPrivKey: string;
+          }>({
+            model: "onyxKey",
+            where: [{ field: "deviceToken", operator: "eq", value: deviceToken }],
+          });
+
+          if (!record) {
+            throw new APIError("UNAUTHORIZED", { message: "Invalid Pass" });
+          }
+
+          // Decrypt private key in memory — never stored or returned
+          decryptPrivKey(record.encryptedPrivKey);
+
+          // Rotate device token immediately
+          const nextToken = newDeviceToken();
+          await ctx.context.adapter.update({
+            model: "onyxKey",
+            where: [{ field: "id", operator: "eq", value: record.id }],
+            update: { deviceToken: nextToken, updatedAt: new Date() },
+          });
+
+          const user = await ctx.context.adapter.findOne<{
+            id: string; email: string; name: string; emailVerified: boolean;
+            createdAt: Date; updatedAt: Date;
+          }>({
+            model: "user",
+            where: [{ field: "id", operator: "eq", value: record.userId }],
+          });
+
+          if (!user) throw new APIError("INTERNAL_SERVER_ERROR", { message: "User not found" });
+
+          const session = await ctx.context.internalAdapter.createSession(user.id);
+          if (!session) throw new APIError("INTERNAL_SERVER_ERROR", { message: "Failed to create session" });
+
+          await setSessionCookie(ctx, { session, user });
+
+          return ctx.json({ deviceToken: nextToken });
         },
       ),
     },

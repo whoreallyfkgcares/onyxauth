@@ -5,7 +5,7 @@ import Image from "next/image";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { authClient } from "@/lib/auth-client";
-import { getOrCreateOnyxIdentity } from "@/lib/onyx/identity";
+import { saveDeviceToken } from "@/lib/onyx/identity";
 
 interface SavePassPromptProps {
   onDone: () => void;
@@ -18,13 +18,13 @@ export function SavePassPrompt({ onDone }: SavePassPromptProps) {
   async function savePass() {
     setSaving(true);
     try {
-      const identity = await getOrCreateOnyxIdentity();
-      const publicKey = identity.publicKey;
-      await (authClient as any).onyx.link({ publicKey });
+      const res = await (authClient as any).onyx.createPass({});
+      if (res.error) throw new Error(res.error.message);
+      saveDeviceToken(res.data.deviceToken);
       setSaved(true);
       setTimeout(onDone, 1000);
     } catch {
-      // if linking fails, just continue — Pass is still in localStorage
+      // Pass creation failed — skip silently and continue
       setSaved(true);
       setTimeout(onDone, 1000);
     } finally {
@@ -47,7 +47,7 @@ export function SavePassPrompt({ onDone }: SavePassPromptProps) {
           <div className="flex flex-col items-center gap-2 text-center">
             <h2 className="text-base font-medium">Save Your Onyx Pass.</h2>
             <p className="text-xs text-muted-foreground text-balance leading-relaxed">
-              Your Pass is a key stored in this browser. Any Onyx project can use
+              Your Pass is a key stored on this device. Any Onyx project can use
               it to sign you in instantly — no password needed.
             </p>
           </div>
