@@ -8,22 +8,24 @@ Built on Next.js 16 + Better Auth 1.6 + Postgres + shadcn/ui (Vercel dark theme)
 
 ## Stack
 - Framework: Next.js 16 (breaking changes — middleware is proxy.ts with named export `proxy`, cookies()/headers() must be awaited)
-- Auth: Better Auth 1.6 (plugins: onyx keypair, nextCookies)
+- Auth: Better Auth 1.6 (plugins: onyx pass, nextCookies)
 - DB: Postgres via pg Pool
-- UI: shadcn/ui v4 (radix/lyra preset — all rounded-none manually patched to rounded-md/xl)
+- UI: shadcn/ui v4 (radix/lyra preset — rounded-none patched to rounded-md/xl, overflow-hidden removed from Card)
 - Styling: Vercel dark — pure black bg, Geist Sans, white primary, white focus rings
 - App name: configured via NEXT_PUBLIC_APP_NAME env var, defaults to "Zero" (src/lib/config.ts)
 
 ## Auth methods
 1. Email + password (Better Auth built-in)
-2. Google OAuth (optional, enabled if GOOGLE_CLIENT_ID/SECRET set)
-3. GitHub OAuth (optional, enabled if GITHUB_CLIENT_ID/SECRET set)
-4. Onyx Pass — Ed25519 keypair stored in localStorage (onyx.identity.v1)
-   - Challenge/verify flow: POST /api/auth/onyx/challenge → POST /api/auth/onyx/verify
-   - Link Pass to existing account: POST /api/auth/onyx/link (requires session cookie)
-   - Client lib: src/lib/onyx/identity.ts (getOrCreateOnyxIdentity, signOnyxChallenge)
+2. Google OAuth (credentials in .env.local — GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET)
+3. GitHub OAuth (credentials in .env.local — GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET)
+4. Onyx Pass — server-managed Ed25519 keypair, client holds only a rotating device token
+   - Token stored in localStorage under key "onyx.pass.v2"
+   - POST /onyx/create-pass  (requires session) — generates keypair, returns { deviceToken, publicKey }
+   - POST /onyx/auth { deviceToken } — looks up record, creates session, rotates token, returns { deviceToken }
+   - Private key never leaves the server; encrypted at rest with AES-256-GCM (PASS_ENCRYPTION_KEY)
    - Server plugin: src/lib/onyx/plugin.ts
    - Client plugin: src/lib/onyx/client.ts
+   - Client helpers: src/lib/onyx/identity.ts (getDeviceToken, saveDeviceToken, clearDeviceToken, hasPass)
 
 ## Cross-subdomain session
 Session cookie is set with domain=COOKIE_DOMAIN (e.g. .onyxpowered.com).
@@ -39,40 +41,60 @@ After auth, user is redirected to redirectTo. Only *.onyxpowered.com destination
 accepted (validated in src/lib/redirect.ts) — anything else falls back to /account.
 The redirectTo param is preserved across login↔signup navigation and through Pass flow.
 
-## Key env vars (production)
+## Env vars
+
+### Local dev (.env.local — committed, OAuth keys are safe to share)
+  DATABASE_URL=postgres://localhost/onyxauth
+  BETTER_AUTH_SECRET=O/OsPUBXbZmvuD/+8DLbmOvM20QEO9j10KEppOlCCQQ=
+  BETTER_AUTH_URL=http://localhost:3001
+  BETTER_AUTH_TRUSTED_ORIGINS=http://localhost:3001
+  PASS_ENCRYPTION_KEY=wS9gQfMaNTywrqlerHsembmEhSMTi9HA8FtKKno+Tm4=
+  GOOGLE_CLIENT_ID=947097464451-24gpoemtm1vksupr6mlh221qqt7l25qd.apps.googleusercontent.com
+  GOOGLE_CLIENT_SECRET=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
+  GITHUB_CLIENT_ID=Ov23liwulNZMDulnvtqA
+  GITHUB_CLIENT_SECRET=c663910b08ede7ed19cd4a15ae3f3e29e180d610
+
+### Production (set in server environment, never commit)
   DATABASE_URL                  Postgres connection string
-  BETTER_AUTH_SECRET            Random secret for signing tokens
+  BETTER_AUTH_SECRET            New random secret — rotate from dev value
   BETTER_AUTH_URL               https://auth.onyxpowered.com
   COOKIE_DOMAIN                 .onyxpowered.com
-  BETTER_AUTH_TRUSTED_ORIGINS   Comma-separated app origins, e.g.:
-                                  https://zero.onyxpowered.com,https://opal.onyxpowered.com
+  BETTER_AUTH_TRUSTED_ORIGINS   Comma-separated app origins
+  PASS_ENCRYPTION_KEY           New 32-byte AES key — rotate from dev value
   NEXT_PUBLIC_APP_NAME          Platform name shown in UI (default: "Zero")
-  GOOGLE_CLIENT_ID/SECRET       Optional — enables Google sign-in
-  GITHUB_CLIENT_ID/SECRET       Optional — enables GitHub sign-in
+  GOOGLE_CLIENT_ID/SECRET       Same OAuth creds (or prod app credentials)
+  GITHUB_CLIENT_ID/SECRET       Same OAuth creds (or prod app credentials)
 
 ## Key source files
-  src/lib/auth.ts               Better Auth server config
-  src/lib/auth-client.ts        Better Auth client config
-  src/lib/onyx/plugin.ts        Onyx keypair server plugin (challenge, verify, link endpoints)
-  src/lib/onyx/client.ts        Onyx keypair client plugin
-  src/lib/onyx/identity.ts      Client-side keypair generation/signing (localStorage)
-  src/lib/redirect.ts           redirectTo validation (*.onyxpowered.com only)
-  src/lib/config.ts             APP_NAME config
-  src/proxy.ts                  Route protection + redirectTo passthrough (Next.js 16 middleware)
-  src/app/api/auth/[...all]/route.ts  Better Auth handler
-  src/components/auth/          All auth UI components
-  src/components/onyx-logo.tsx  OnyxWhite.png logo component
+  src/lib/auth.ts                           Better Auth server config
+  src/lib/auth-client.ts                    Better Auth client config
+  src/lib/onyx/plugin.ts                    Onyx Pass server plugin
+  src/lib/onyx/client.ts                    Onyx Pass client plugin
+  src/lib/onyx/identity.ts                  Device token helpers (localStorage)
+  src/lib/redirect.ts                       redirectTo validation (*.onyxpowered.com only)
+  src/lib/config.ts                         APP_NAME config
+  src/proxy.ts                              Route protection + redirectTo passthrough
+  src/app/api/auth/[...all]/route.ts        Better Auth handler
+  src/components/auth/login-form.tsx        Login UI
+  src/components/auth/signup-form.tsx       Multi-step signup UI (name → email/password)
+  src/components/auth/save-pass-prompt.tsx  Post-signup Pass setup prompt
+  src/components/auth/onyx-sign-in-button.tsx  Pass sign-in button
+  src/components/auth/forgot-password-form.tsx  Forgot password UI
+  src/components/auth/reset-password-form.tsx   Reset password UI (reads ?token= from URL)
+  src/app/forgot-password/page.tsx          Forgot password page
+  src/app/reset-password/page.tsx           Reset password page
 
 ## Post-signup Pass flow
-After email signup, user is shown SavePassPrompt (src/components/auth/save-pass-prompt.tsx).
-"Save Pass" generates a keypair via getOrCreateOnyxIdentity(), then calls /onyx/link to bind
-it to the new account. "Skip" redirects directly to redirectTo (or /account).
+After email signup, user sees SavePassPrompt. "Save Pass" calls POST /onyx/create-pass,
+saves the returned deviceToken to localStorage. "Skip" goes straight to redirectTo.
 
-## Cross-device Pass (TODO — Option A, implement when email server is available)
-Private key is currently localStorage-only (single browser).
-Plan: encrypt private key client-side with PBKDF2-derived key from user password,
-store ciphertext server-side. On new device: email auth → fetch blob → decrypt → import.
+## Onyx Pass — security notes
+- PASS_ENCRYPTION_KEY must be rotated before production (dev key is committed)
+- /onyx/auth endpoint needs rate limiting before production
+- redirectTo is validated client-side in safeRedirectTo(); add server-side check for defense in depth
+- Device token rotates on every auth — stale tokens are immediately invalidated
 
 ## Pending (needs email server)
-- Forgot password / reset flow
+- Wire forgot password email transport (Better Auth sendResetPassword hook in src/lib/auth.ts)
 - Email verification
+- Cross-device Pass: after email auth on new device, decrypt stored key and issue new device token
